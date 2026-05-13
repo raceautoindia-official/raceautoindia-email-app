@@ -16,7 +16,7 @@
     "bootstrap": "^5.3.6",
     "html-to-text": "^9.0.5",
     "mysql2": "^3.14.1",
-    "next": "15.3.8",
+    "next": "^15.3.9",
     "react": "19.0.0",
     "react-bootstrap": "^2.10.10",
     "react-dom": "19.0.0",
