@@ -2,6 +2,11 @@ import { NextResponse } from "next/server";
 import https from "https";
 import db from "@/lib/db";
 import { addSuppressions } from "@/lib/suppression";
+import { verifySnsMessage } from "@/lib/snsVerify";
+import { upsertEmailEvent } from "@/lib/emailEvents";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 async function parseBody(req) {
   const reader = req.body.getReader();
@@ -14,19 +19,55 @@ async function parseBody(req) {
   return Buffer.concat(chunks).toString("utf-8");
 }
 
-const statusRank = {
-  Delivery: 1,
-  Open: 2,
-  Click: 3,
-  Bounce: 4,
-  Complaint: 5,
-};
+// Normalize SES event types to the values used in the DB / UI.
+function normalizeEventType(t) {
+  if (t === "Send") return "Sent";
+  return t;
+}
+
+// Pick the event-specific timestamp. Falls back to mail.timestamp (send time)
+// so a row always has something, but events that happen later (Open/Click) get
+// their real timestamp.
+function pickEventTime(eventType, snsMessage) {
+  const sub = {
+    Sent: snsMessage.send?.timestamp,
+    Delivery: snsMessage.delivery?.timestamp,
+    Open: snsMessage.open?.timestamp,
+    Click: snsMessage.click?.timestamp,
+    Bounce: snsMessage.bounce?.timestamp,
+    Complaint: snsMessage.complaint?.timestamp,
+  }[eventType];
+  const raw = sub || snsMessage.mail?.timestamp || new Date().toISOString();
+  const d = new Date(raw);
+  return isNaN(d.getTime()) ? new Date() : d;
+}
+
+async function confirmSubscription(subscribeURL) {
+  if (
+    !subscribeURL ||
+    !/^https:\/\/sns\.[a-z0-9-]+\.amazonaws\.com\/[^\s]*$/i.test(subscribeURL)
+  ) {
+    return false;
+  }
+  return new Promise((resolve) => {
+    const req = https.get(subscribeURL, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode === 200));
+      res.on("error", () => resolve(false));
+    });
+    req.on("error", () => resolve(false));
+    req.setTimeout(10_000, () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
 
 async function syncLastEvent(email, status, eventTime) {
   try {
     await db.execute(
       `UPDATE emails
-       SET last_event_status = ?, last_event_at = ?
+         SET last_event_status = ?, last_event_at = ?
        WHERE email = ?
          AND (last_event_at IS NULL OR last_event_at <= ?)`,
       [status, eventTime, email, eventTime]
@@ -58,100 +99,83 @@ export async function POST(req) {
     const messageType = req.headers.get("x-amz-sns-message-type");
     const rawBody = await parseBody(req);
 
-    if (messageType === "SubscriptionConfirmation") {
-      const { SubscribeURL } = JSON.parse(rawBody);
-      // SubscribeURL is provided by AWS only over HTTPS to amazonaws.com domains.
-      if (SubscribeURL && /^https:\/\/[a-z0-9.-]+\.amazonaws\.com\//i.test(SubscribeURL)) {
-        https.get(SubscribeURL, () => {
-          console.log("✅ SNS subscription confirmed");
-        });
+    let outer;
+    try {
+      outer = JSON.parse(rawBody);
+    } catch {
+      return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+    }
+
+    const verified = await verifySnsMessage(outer);
+    if (!verified.ok) {
+      console.warn("SNS signature rejected:", verified.error);
+      return NextResponse.json({ error: "Signature invalid" }, { status: 403 });
+    }
+
+    if (messageType === "SubscriptionConfirmation" || messageType === "UnsubscribeConfirmation") {
+      const ok = await confirmSubscription(outer.SubscribeURL);
+      if (ok) {
+        console.log("✅ SNS subscription confirmed");
         return NextResponse.json({ message: "Subscribed" });
       }
       return NextResponse.json({ error: "Invalid SubscribeURL" }, { status: 400 });
     }
 
-    if (messageType === "Notification") {
-      const snsMessage = JSON.parse(JSON.parse(rawBody).Message);
-      const eventType = snsMessage.eventType || snsMessage.notificationType || "unknown";
-      const messageId = snsMessage.mail?.messageId || "unknown";
-      const email = snsMessage.mail?.destination?.[0] || "unknown";
-      const eventTime = new Date(snsMessage.mail?.timestamp || Date.now());
-
-      let link = null;
-      let ip = null;
-      let userAgent = null;
-      if (eventType === "Click") {
-        link = snsMessage.click?.link || null;
-        ip = snsMessage.click?.ipAddress || null;
-        userAgent = snsMessage.click?.userAgent || null;
-      } else if (eventType === "Open") {
-        ip = snsMessage.open?.ipAddress || null;
-        userAgent = snsMessage.open?.userAgent || null;
-      }
-
-      const [rows] = await db.query(
-        `SELECT status, job_id, campaign_id FROM email_events WHERE messageId = ?`,
-        [messageId]
-      );
-      const existing = rows[0];
-      const incomingRank = statusRank[eventType] ?? 0;
-      const existingRank = statusRank[existing?.status] ?? 0;
-
-      // Lookup the job that produced this messageId (worker writes ses_message_id).
-      let jobId = existing?.job_id || null;
-      let campaignId = existing?.campaign_id || null;
-      if (!jobId && messageId !== "unknown") {
-        try {
-          const [jr] = await db.query(
-            `SELECT r.job_id, j.campaign_id
-             FROM email_job_recipients r
-             LEFT JOIN email_jobs j ON j.id = r.job_id
-             WHERE r.ses_message_id = ?
-             LIMIT 1`,
-            [messageId]
-          );
-          if (jr[0]) {
-            jobId = jr[0].job_id || null;
-            campaignId = jr[0].campaign_id || null;
-          }
-        } catch (_) { /* non-fatal */ }
-      }
-
-      if (!existing) {
-        await db.query(
-          `INSERT INTO email_events
-           (messageId, email, status, link, ip, userAgent, eventTime, job_id, campaign_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [messageId, email, eventType, link, ip, userAgent, eventTime, jobId, campaignId]
-        );
-      } else if (incomingRank > existingRank) {
-        await db.query(
-          `UPDATE email_events
-           SET status = ?, link = ?, ip = ?, userAgent = ?, eventTime = ?,
-               job_id = COALESCE(job_id, ?), campaign_id = COALESCE(campaign_id, ?)
-           WHERE messageId = ?`,
-          [eventType, link, ip, userAgent, eventTime, jobId, campaignId, messageId]
-        );
-      } else if (jobId && !existing.job_id) {
-        // backfill job_id without overwriting status
-        await db.query(
-          `UPDATE email_events SET job_id = ?, campaign_id = COALESCE(campaign_id, ?) WHERE messageId = ?`,
-          [jobId, campaignId, messageId]
-        );
-      }
-
-      // sync per-subscriber last event + auto-suppress hard bounces / complaints
-      if (email && email !== "unknown") {
-        await syncLastEvent(email, eventType, eventTime);
-        await autoSuppress(email, eventType, snsMessage);
-      }
-
-      return NextResponse.json({ message: "Processed" });
+    if (messageType !== "Notification") {
+      return NextResponse.json({ message: "Ignored" });
     }
 
-    return NextResponse.json({ message: "Ignored" });
+    let snsMessage;
+    try {
+      snsMessage = JSON.parse(outer.Message);
+    } catch {
+      return NextResponse.json({ error: "Invalid inner Message" }, { status: 400 });
+    }
+
+    const rawType = snsMessage.eventType || snsMessage.notificationType || "unknown";
+    const eventType = normalizeEventType(rawType);
+    const messageId = snsMessage.mail?.messageId || "unknown";
+    const email =
+      snsMessage.mail?.destination?.[0] ||
+      snsMessage.bounce?.bouncedRecipients?.[0]?.emailAddress ||
+      snsMessage.complaint?.complainedRecipients?.[0]?.emailAddress ||
+      "unknown";
+    const subject = snsMessage.mail?.commonHeaders?.subject || null;
+    const eventTime = pickEventTime(eventType, snsMessage);
+
+    let link = null;
+    let ip = null;
+    let userAgent = null;
+    if (eventType === "Click") {
+      link = snsMessage.click?.link || null;
+      ip = snsMessage.click?.ipAddress || null;
+      userAgent = snsMessage.click?.userAgent || null;
+    } else if (eventType === "Open") {
+      ip = snsMessage.open?.ipAddress || null;
+      userAgent = snsMessage.open?.userAgent || null;
+    }
+
+    if (messageId !== "unknown") {
+      await upsertEmailEvent({
+        messageId,
+        email,
+        subject,
+        status: eventType,
+        link,
+        ip,
+        userAgent,
+        eventTime,
+      });
+    }
+
+    if (email && email !== "unknown") {
+      await syncLastEvent(email, eventType, eventTime);
+      await autoSuppress(email, eventType, snsMessage);
+    }
+
+    return NextResponse.json({ message: "Processed" });
   } catch (err) {
-    console.error("❌ SNS error:", err.message);
+    console.error("❌ SNS error:", err);
     return NextResponse.json({ error: "Invalid SNS message" }, { status: 400 });
   }
 }
