@@ -1,16 +1,15 @@
 import { NextResponse } from "next/server";
-import progressStore from "@/lib/emailProgressStore";
+import { getJobProgress } from "@/lib/jobs";
 
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const jobId = searchParams.get("jobId");
-
-  if (!jobId || !progressStore.has(jobId)) {
-    return NextResponse.json({ error: "Invalid jobId" }, { status: 400 });
+  if (!jobId) {
+    return NextResponse.json({ error: "Missing jobId" }, { status: 400 });
   }
-
-  const { total, completed } = progressStore.get(jobId);
-  const percent = Math.round((completed / total) * 100);
-
-  return NextResponse.json({ total, completed, percent });
+  const data = await getJobProgress(jobId);
+  if (!data) {
+    return NextResponse.json({ error: "Unknown jobId" }, { status: 404 });
+  }
+  return NextResponse.json(data);
 }

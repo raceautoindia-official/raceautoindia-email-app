@@ -5,10 +5,13 @@ export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const from = searchParams.get("from");
   const to = searchParams.get("to");
-  const page = parseInt(searchParams.get("page") || "1", 10);
-  const limit = parseInt(searchParams.get("limit") || "100", 10);
+  const page = Math.max(1, parseInt(searchParams.get("page") || "1", 10));
+  const limit = Math.max(1, Math.min(100000, parseInt(searchParams.get("limit") || "100", 10)));
   const offset = (page - 1) * limit;
   const status = searchParams.get("status");
+  const q = (searchParams.get("q") || "").trim();
+  const jobId = searchParams.get("jobId");
+  const campaignId = searchParams.get("campaignId");
 
   if (!from || !to) {
     return NextResponse.json(
@@ -18,44 +21,81 @@ export async function GET(req) {
   }
 
   try {
-    const queryParams = [from, to];
-    let statusCondition = "";
+    const where = ["eventTime >= ?", "eventTime < DATE_ADD(?, INTERVAL 1 DAY)"];
+    const params = [from, to];
     if (status && status !== "All") {
-      statusCondition = " AND status = ?";
-      queryParams.push(status);
+      where.push("status = ?");
+      params.push(status);
     }
+    if (q) {
+      where.push("email LIKE ?");
+      params.push(`%${q}%`);
+    }
+    if (jobId) {
+      if (jobId === "untagged") {
+        where.push("job_id IS NULL");
+      } else {
+        where.push("job_id = ?");
+        params.push(Number(jobId));
+      }
+    }
+    if (campaignId) {
+      if (campaignId === "untagged") {
+        where.push("campaign_id IS NULL");
+      } else {
+        where.push("campaign_id = ?");
+        params.push(Number(campaignId));
+      }
+    }
+    const whereSql = where.join(" AND ");
 
-    // ✅ Paginated records with optional status
     const [records] = await db.query(
-      `
-      SELECT SQL_CALC_FOUND_ROWS messageId, email, subject, status, link, ip, userAgent, eventTime
-      FROM email_events
-      WHERE DATE(eventTime) BETWEEN ? AND ?
-      ${statusCondition}
-      ORDER BY eventTime DESC
-      LIMIT ? OFFSET ?
-      `,
-      [...queryParams, limit, offset]
+      `SELECT messageId, email, subject, status, link, ip, userAgent, eventTime,
+              job_id, campaign_id
+       FROM email_events
+       WHERE ${whereSql}
+       ORDER BY eventTime DESC
+       LIMIT ${limit} OFFSET ${offset}`,
+      params
+    );
+    const [[{ total }]] = await db.query(
+      `SELECT COUNT(*) AS total FROM email_events WHERE ${whereSql}`,
+      params
     );
 
-    // ✅ Total count of filtered records
-    const [totalResult] = await db.query(`SELECT FOUND_ROWS() AS total`);
-    const total = totalResult[0].total;
-
-    // ✅ Counts for all statuses (not filtered, for summary UI)
+    // counts ignore status filter so summary always shows all buckets in range
+    const countWhere = ["eventTime >= ?", "eventTime < DATE_ADD(?, INTERVAL 1 DAY)"];
+    const countParams = [from, to];
+    if (q) {
+      countWhere.push("email LIKE ?");
+      countParams.push(`%${q}%`);
+    }
+    if (jobId) {
+      if (jobId === "untagged") {
+        countWhere.push("job_id IS NULL");
+      } else {
+        countWhere.push("job_id = ?");
+        countParams.push(Number(jobId));
+      }
+    }
+    if (campaignId) {
+      if (campaignId === "untagged") {
+        countWhere.push("campaign_id IS NULL");
+      } else {
+        countWhere.push("campaign_id = ?");
+        countParams.push(Number(campaignId));
+      }
+    }
     const [statusRows] = await db.query(
-      `
-      SELECT status, COUNT(*) AS count
-      FROM email_events
-      WHERE DATE(eventTime) BETWEEN ? AND ?
-      GROUP BY status
-      `,
-      [from, to]
+      `SELECT status, COUNT(*) AS count
+       FROM email_events
+       WHERE ${countWhere.join(" AND ")}
+       GROUP BY status`,
+      countParams
     );
-
     const counts = {};
-    statusRows.forEach(row => {
-      counts[row.status] = row.count;
+    statusRows.forEach((r) => {
+      counts[r.status] = Number(r.count);
     });
 
     return NextResponse.json({

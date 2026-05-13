@@ -1,4 +1,3 @@
-// app/api/admin/email-status/excel/route.js
 import { NextResponse } from "next/server";
 import db from "@/lib/db";
 import * as XLSX from "xlsx";
@@ -9,34 +8,51 @@ export async function GET(request) {
     const from = searchParams.get("from");
     const to = searchParams.get("to");
     const status = searchParams.get("status") || "All";
+    const q = (searchParams.get("q") || "").trim();
+    const jobId = searchParams.get("jobId");
+    const campaignId = searchParams.get("campaignId");
 
-    // parse page/limit just in case (we'll ignore page here and grab all)
-    const page = parseInt(searchParams.get("page") || "1", 10);
-    const limit = parseInt(searchParams.get("limit") || "1000000", 10);
-    const offset = (page - 1) * limit;
-
-    // build parameters for date (+ optional status)
-    const params = [from, to];
-    let where = "WHERE eventTime BETWEEN ? AND ?";
-    if (status !== "All") {
-      where += " AND status = ?";
-      params.push(status);
+    if (!from || !to) {
+      return NextResponse.json({ error: "Missing 'from' or 'to'" }, { status: 400 });
     }
 
-    // interpolate LIMIT/OFFSET directly (no placeholders)
+    const where = ["eventTime >= ?", "eventTime < DATE_ADD(?, INTERVAL 1 DAY)"];
+    const params = [from, to];
+    if (status !== "All") {
+      where.push("status = ?");
+      params.push(status);
+    }
+    if (q) {
+      where.push("email LIKE ?");
+      params.push(`%${q}%`);
+    }
+    if (jobId) {
+      if (jobId === "untagged") {
+        where.push("job_id IS NULL");
+      } else {
+        where.push("job_id = ?");
+        params.push(Number(jobId));
+      }
+    }
+    if (campaignId) {
+      if (campaignId === "untagged") {
+        where.push("campaign_id IS NULL");
+      } else {
+        where.push("campaign_id = ?");
+        params.push(Number(campaignId));
+      }
+    }
+
     const sql = `
       SELECT email, status, link, ip, userAgent, eventTime
       FROM email_events
-      ${where}
+      WHERE ${where.join(" AND ")}
       ORDER BY eventTime DESC
-      LIMIT ${offset}, ${limit}
     `;
+    const [records] = await db.query(sql, params);
 
-    const [records] = await db.execute(sql, params);
-
-    // build worksheet
     const header = ["Email", "Status", "Link", "IP", "User Agent", "Time"];
-    const data = records.map(r => [
+    const data = records.map((r) => [
       r.email,
       r.status,
       r.link || "",
@@ -47,11 +63,8 @@ export async function GET(request) {
     const ws = XLSX.utils.aoa_to_sheet([header, ...data]);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Report");
-
-    // write to buffer
     const buf = XLSX.write(wb, { bookType: "xlsx", type: "buffer" });
 
-    // return as an attachment
     return new NextResponse(buf, {
       status: 200,
       headers: {
@@ -62,9 +75,6 @@ export async function GET(request) {
     });
   } catch (err) {
     console.error("Excel export error:", err);
-    return NextResponse.json(
-      { error: "Failed to generate report" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: "Failed to generate report" }, { status: 500 });
   }
 }

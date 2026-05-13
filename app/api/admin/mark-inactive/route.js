@@ -1,29 +1,63 @@
-// File: /app/api/admin/mark-inactive/route.js (or .ts if using TypeScript)
-
 import db from "@/lib/db";
 import { NextResponse } from "next/server";
+import { addSuppressions } from "@/lib/suppression";
+import { audit } from "@/lib/audit";
 
 export async function POST(req) {
   try {
     const body = await req.json();
-    const emails = body.emails;
+    let emails = Array.isArray(body.emails) ? body.emails : null;
+    const fromDate = body.from;
+    const toDate = body.to;
+    const status = body.status || "Bounce";
+    const suppress = body.suppress !== false; // default: also add to suppression list
 
-    if (!Array.isArray(emails) || emails.length === 0) {
+    // Server-side bulk: resolve emails from date+status filter (no client list needed).
+    if (!emails && fromDate && toDate) {
+      const [rows] = await db.query(
+        `SELECT DISTINCT email FROM email_events
+         WHERE eventTime >= ? AND eventTime < DATE_ADD(?, INTERVAL 1 DAY)
+           AND status = ?`,
+        [fromDate, toDate, status]
+      );
+      emails = rows.map((r) => r.email);
+    }
+
+    if (!Array.isArray(emails) || !emails.length) {
       return NextResponse.json(
-        { success: false, message: "No emails provided." },
+        { success: false, message: "No emails to mark." },
         { status: 400 }
       );
     }
 
-    // Update all given emails to subscribe = 0
-    const placeholders = emails.map(() => "?").join(",");
-    const query = `UPDATE emails SET subscribe = 0 WHERE email IN (${placeholders})`;
+    const ph = emails.map(() => "?").join(",");
+    const [res] = await db.execute(
+      `UPDATE emails SET subscribe = 0 WHERE email IN (${ph})`,
+      emails
+    );
 
-    const [result] = await db.execute(query, emails);
+    let suppressedAdded = 0;
+    if (suppress) {
+      suppressedAdded = await addSuppressions(
+        emails.map((email) => ({
+          email,
+          reason: status === "Complaint" ? "complaint" : "bounce",
+          source: "mark-inactive",
+        }))
+      );
+    }
+
+    await audit({
+      action: "mark_inactive",
+      targetType: "emails",
+      payload: { count: emails.length, status, suppressedAdded },
+    });
 
     return NextResponse.json({
       success: true,
-      message: `Marked ${result.affectedRows} email(s) as unsubscribed.`,
+      message: `Marked ${res.affectedRows} email(s) as unsubscribed.`,
+      affected: res.affectedRows,
+      suppressedAdded,
     });
   } catch (err) {
     console.error("Bulk unsubscribe error:", err);

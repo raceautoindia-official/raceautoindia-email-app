@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import https from "https";
 import db from "@/lib/db";
+import { addSuppressions } from "@/lib/suppression";
 
 async function parseBody(req) {
   const reader = req.body.getReader();
@@ -13,7 +14,6 @@ async function parseBody(req) {
   return Buffer.concat(chunks).toString("utf-8");
 }
 
-// Priority of statuses from lowest to highest
 const statusRank = {
   Delivery: 1,
   Open: 2,
@@ -22,6 +22,37 @@ const statusRank = {
   Complaint: 5,
 };
 
+async function syncLastEvent(email, status, eventTime) {
+  try {
+    await db.execute(
+      `UPDATE emails
+       SET last_event_status = ?, last_event_at = ?
+       WHERE email = ?
+         AND (last_event_at IS NULL OR last_event_at <= ?)`,
+      [status, eventTime, email, eventTime]
+    );
+  } catch (err) {
+    console.warn("syncLastEvent failed:", err.message);
+  }
+}
+
+async function autoSuppress(email, eventType, snsMessage) {
+  try {
+    if (eventType === "Bounce") {
+      const bounceType = snsMessage?.bounce?.bounceType;
+      if (bounceType === "Permanent") {
+        await addSuppressions([{ email, reason: "bounce", source: "ses-sns" }]);
+        await db.execute(`UPDATE emails SET subscribe = 0 WHERE email = ?`, [email]);
+      }
+    } else if (eventType === "Complaint") {
+      await addSuppressions([{ email, reason: "complaint", source: "ses-sns" }]);
+      await db.execute(`UPDATE emails SET subscribe = 0 WHERE email = ?`, [email]);
+    }
+  } catch (err) {
+    console.warn("autoSuppress failed:", err.message);
+  }
+}
+
 export async function POST(req) {
   try {
     const messageType = req.headers.get("x-amz-sns-message-type");
@@ -29,10 +60,14 @@ export async function POST(req) {
 
     if (messageType === "SubscriptionConfirmation") {
       const { SubscribeURL } = JSON.parse(rawBody);
-      https.get(SubscribeURL, () => {
-        console.log("✅ SNS subscription confirmed");
-      });
-      return NextResponse.json({ message: "Subscribed" });
+      // SubscribeURL is provided by AWS only over HTTPS to amazonaws.com domains.
+      if (SubscribeURL && /^https:\/\/[a-z0-9.-]+\.amazonaws\.com\//i.test(SubscribeURL)) {
+        https.get(SubscribeURL, () => {
+          console.log("✅ SNS subscription confirmed");
+        });
+        return NextResponse.json({ message: "Subscribed" });
+      }
+      return NextResponse.json({ error: "Invalid SubscribeURL" }, { status: 400 });
     }
 
     if (messageType === "Notification") {
@@ -40,61 +75,75 @@ export async function POST(req) {
       const eventType = snsMessage.eventType || snsMessage.notificationType || "unknown";
       const messageId = snsMessage.mail?.messageId || "unknown";
       const email = snsMessage.mail?.destination?.[0] || "unknown";
-      const eventTime = snsMessage.mail?.timestamp || new Date().toISOString();
+      const eventTime = new Date(snsMessage.mail?.timestamp || Date.now());
 
       let link = null;
       let ip = null;
       let userAgent = null;
-
       if (eventType === "Click") {
         link = snsMessage.click?.link || null;
         ip = snsMessage.click?.ipAddress || null;
         userAgent = snsMessage.click?.userAgent || null;
-        console.log(`🔗 Click by ${email} on ${link}`);
       } else if (eventType === "Open") {
         ip = snsMessage.open?.ipAddress || null;
         userAgent = snsMessage.open?.userAgent || null;
-        console.log(`👁️ Open by ${email}`);
-      } else if (eventType === "Delivery") {
-        console.log(`📬 Delivered to ${email} at ${eventTime}`);
-      } else if (eventType === "Bounce") {
-        console.log(`📛 Bounce for ${email}`);
-      } else if (eventType === "Complaint") {
-        console.log(`🛑 Complaint from ${email}`);
-      } else {
-        console.log(`ℹ️ Other event: ${eventType} for ${email}`);
       }
 
-      // Fetch existing row (if any)
       const [rows] = await db.query(
-        `SELECT status FROM email_events WHERE messageId = ?`,
+        `SELECT status, job_id, campaign_id FROM email_events WHERE messageId = ?`,
         [messageId]
       );
       const existing = rows[0];
-
       const incomingRank = statusRank[eventType] ?? 0;
       const existingRank = statusRank[existing?.status] ?? 0;
 
+      // Lookup the job that produced this messageId (worker writes ses_message_id).
+      let jobId = existing?.job_id || null;
+      let campaignId = existing?.campaign_id || null;
+      if (!jobId && messageId !== "unknown") {
+        try {
+          const [jr] = await db.query(
+            `SELECT r.job_id, j.campaign_id
+             FROM email_job_recipients r
+             LEFT JOIN email_jobs j ON j.id = r.job_id
+             WHERE r.ses_message_id = ?
+             LIMIT 1`,
+            [messageId]
+          );
+          if (jr[0]) {
+            jobId = jr[0].job_id || null;
+            campaignId = jr[0].campaign_id || null;
+          }
+        } catch (_) { /* non-fatal */ }
+      }
+
       if (!existing) {
-        // No record exists yet — insert
         await db.query(
-          `INSERT INTO email_events (
-            messageId, email, status, link, ip, userAgent, eventTime
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [messageId, email, eventType, link, ip, userAgent, new Date(eventTime)]
+          `INSERT INTO email_events
+           (messageId, email, status, link, ip, userAgent, eventTime, job_id, campaign_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [messageId, email, eventType, link, ip, userAgent, eventTime, jobId, campaignId]
         );
-        console.log(`✅ New status '${eventType}' recorded for ${email}`);
       } else if (incomingRank > existingRank) {
-        // Incoming status is higher priority — update
         await db.query(
           `UPDATE email_events
-           SET status = ?, link = ?, ip = ?, userAgent = ?, eventTime = ?
+           SET status = ?, link = ?, ip = ?, userAgent = ?, eventTime = ?,
+               job_id = COALESCE(job_id, ?), campaign_id = COALESCE(campaign_id, ?)
            WHERE messageId = ?`,
-          [eventType, link, ip, userAgent, new Date(eventTime), messageId]
+          [eventType, link, ip, userAgent, eventTime, jobId, campaignId, messageId]
         );
-        console.log(`🔁 Updated status to '${eventType}' for ${email}`);
-      } else {
-        console.log(`⏩ Skipped '${eventType}' for ${email} — current: '${existing.status}'`);
+      } else if (jobId && !existing.job_id) {
+        // backfill job_id without overwriting status
+        await db.query(
+          `UPDATE email_events SET job_id = ?, campaign_id = COALESCE(campaign_id, ?) WHERE messageId = ?`,
+          [jobId, campaignId, messageId]
+        );
+      }
+
+      // sync per-subscriber last event + auto-suppress hard bounces / complaints
+      if (email && email !== "unknown") {
+        await syncLastEvent(email, eventType, eventTime);
+        await autoSuppress(email, eventType, snsMessage);
       }
 
       return NextResponse.json({ message: "Processed" });
@@ -102,7 +151,7 @@ export async function POST(req) {
 
     return NextResponse.json({ message: "Ignored" });
   } catch (err) {
-    console.error("❌ Error:", err.message);
+    console.error("❌ SNS error:", err.message);
     return NextResponse.json({ error: "Invalid SNS message" }, { status: 400 });
   }
 }
