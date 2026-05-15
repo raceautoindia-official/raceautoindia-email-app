@@ -1,6 +1,7 @@
 import { sendOne } from "@/lib/awsclient";
 import { NextResponse } from "next/server";
 import { convert } from "html-to-text";
+import { makeUnsubToken } from "@/lib/unsubToken";
 
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://newsletter.raceautoindia.com";
@@ -16,8 +17,10 @@ export async function POST(req) {
     }
 
     const enc = encodeURIComponent(recipient);
+    const token = makeUnsubToken(recipient);
+    const link = `${PUBLIC_BASE_URL}/subscription/unsubscribe?email=${enc}&t=${token}`;
     const html = (message || "")
-      .replaceAll("{{unsubscribe_link}}", `${PUBLIC_BASE_URL}/subscription/unsubscribe?email=${enc}`)
+      .replaceAll("{{unsubscribe_link}}", link)
       .replaceAll("{{visible_email}}", recipient);
 
     const result = await sendOne({

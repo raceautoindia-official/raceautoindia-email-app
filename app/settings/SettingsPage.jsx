@@ -361,6 +361,37 @@ export default function SettingsPage() {
           </div></div>
         </Tab>
 
+        <Tab eventKey="deliverability" title="📬 Deliverability">
+          <div className="md-card mt-3"><div className="md-card-body">
+            <h6 className="mb-3">Compliance content</h6>
+            <Row className="g-3">
+              <Col md={12}>
+                <Form.Label>Postal address (CAN-SPAM)</Form.Label>
+                <Form.Control
+                  as="textarea"
+                  rows={2}
+                  value={s.compliance_postal_address || ""}
+                  onChange={(e) => setField("compliance_postal_address", e.target.value)}
+                  placeholder="Race Auto India, 123 Example Street, Chennai 600001, India"
+                />
+                <small className="text-muted">
+                  Required by CAN-SPAM (US) and a strong spam-filter signal. Include this in your email body
+                  (and set <code>REQUIRE_POSTAL_ADDRESS=true</code> in env to make it a hard block on send).
+                </small>
+              </Col>
+            </Row>
+
+            <hr />
+
+            <h6 className="mb-3">Authentication checklist</h6>
+            <DeliverabilityChecklist
+              senders={senders}
+              sesInfo={sesInfo}
+              postalAddress={s.compliance_postal_address}
+            />
+          </div></div>
+        </Tab>
+
         <Tab eventKey="system" title="System">
           <div className="md-card mt-3"><div className="md-card-body">
             <Row className="g-3">
@@ -522,5 +553,112 @@ export default function SettingsPage() {
         </Modal.Footer>
       </Modal>
     </Container>
+  );
+}
+
+const FREE_MAIL = new Set([
+  "gmail.com", "googlemail.com",
+  "yahoo.com", "yahoo.co.in", "ymail.com",
+  "outlook.com", "hotmail.com", "live.com", "msn.com",
+  "aol.com", "icloud.com", "me.com", "mac.com",
+  "proton.me", "protonmail.com", "zoho.com",
+]);
+
+function CheckRow({ ok, title, detail }) {
+  return (
+    <tr>
+      <td style={{ width: 32 }}>
+        {ok === true ? <span style={{ color: "var(--md-success)" }}>✓</span>
+          : ok === false ? <span style={{ color: "var(--md-danger)" }}>✗</span>
+          : <span style={{ color: "var(--md-text-muted)" }}>—</span>}
+      </td>
+      <td>
+        <div style={{ fontWeight: 600 }}>{title}</div>
+        <div className="small text-muted">{detail}</div>
+      </td>
+    </tr>
+  );
+}
+
+function DeliverabilityChecklist({ senders, sesInfo, postalAddress }) {
+  const defaultSender = senders.find((s) => s.is_default) || senders[0];
+  const fromDomain = defaultSender?.email?.split("@")[1]?.toLowerCase() || null;
+  const isFreeMail = fromDomain ? FREE_MAIL.has(fromDomain) : null;
+  const senderVerified = !!defaultSender?.ses_verified;
+  const inProduction = sesInfo && !sesInfo.likelySandbox && sesInfo.sendingEnabled;
+  const hasAddress = !!(postalAddress && postalAddress.trim());
+
+  return (
+    <Table size="sm" className="mb-0 align-middle">
+      <tbody>
+        <CheckRow
+          ok={!!defaultSender}
+          title="Default sender identity"
+          detail={defaultSender
+            ? <>From <code>{defaultSender.email}</code></>
+            : "Add at least one sender on the Sender identities tab."}
+        />
+        <CheckRow
+          ok={fromDomain ? !isFreeMail : null}
+          title="From address uses a domain you control"
+          detail={!defaultSender
+            ? "Set after adding a sender."
+            : isFreeMail
+            ? <>You're sending from <code>@{fromDomain}</code> — DMARC will fail and most receivers will spam-folder this mail. Move to a domain you own (e.g. <code>news@yourcompany.com</code>).</>
+            : <>Good — <code>@{fromDomain}</code> is not a free-mail provider.</>}
+        />
+        <CheckRow
+          ok={defaultSender ? senderVerified : null}
+          title="DKIM / domain verified in SES"
+          detail={!defaultSender
+            ? "—"
+            : senderVerified
+            ? "SES has confirmed this identity. Make sure the DKIM CNAMEs are still present at your DNS provider."
+            : "Open the Sender identities tab → Send verification email, or use 'Verify a domain' to add DKIM CNAMEs."}
+        />
+        <CheckRow
+          ok={inProduction == null ? null : !!inProduction}
+          title="SES production mode"
+          detail={sesInfo?.likelySandbox
+            ? "SES is in SANDBOX — you can only send to verified addresses. Request production access in AWS Console."
+            : sesInfo?.sendingEnabled
+            ? "Account sending is enabled."
+            : "Account sending is paused or unknown."}
+        />
+        <CheckRow
+          ok={hasAddress}
+          title="Postal address configured"
+          detail={hasAddress
+            ? "Will be expected in the email body when REQUIRE_POSTAL_ADDRESS=true."
+            : "Set a physical address above — required by CAN-SPAM and a strong spam-filter signal."}
+        />
+        <CheckRow
+          ok={null}
+          title="List-Unsubscribe headers (RFC 8058)"
+          detail={<>Automatically added to every send: <code>List-Unsubscribe</code>, <code>List-Unsubscribe-Post: One-Click</code>, <code>List-Id</code>, <code>Precedence: bulk</code>.</>}
+        />
+        <CheckRow
+          ok={null}
+          title="Custom MAIL FROM domain (SPF alignment)"
+          detail={<>
+            Set this in the AWS SES console under <em>Identities → {fromDomain || "your domain"} → Custom MAIL FROM domain</em>
+            {" "}(e.g. <code>bounces.{fromDomain || "yourdomain.com"}</code>). Without it, SPF aligns with <code>amazonses.com</code> — DMARC won't pass on SPF.
+          </>}
+        />
+        <CheckRow
+          ok={null}
+          title="DMARC policy in DNS"
+          detail={<>
+            Publish a TXT at <code>_dmarc.{fromDomain || "yourdomain.com"}</code> — start with{" "}
+            <code>v=DMARC1; p=none; rua=mailto:dmarc@{fromDomain || "yourdomain.com"}</code>, monitor a week, then move to <code>p=quarantine</code>.
+          </>}
+        />
+        <CheckRow
+          ok={null}
+          title="UNSUB_SECRET env var"
+          detail={<>Set <code>UNSUB_SECRET</code> in <code>.env</code> to a long random string so unsubscribe tokens can't be forged.</>}
+        />
+      </tbody>
+    </Table>
   );
 }

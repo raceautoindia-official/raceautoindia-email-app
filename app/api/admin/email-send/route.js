@@ -3,6 +3,8 @@ import db from "@/lib/db";
 import * as XLSX from "xlsx";
 import { createJob, addRecipients } from "@/lib/jobs";
 import { getSuppressedSet } from "@/lib/suppression";
+import { resolveSenderForJob } from "@/lib/senders";
+import { isFreeMailFromDomain, bodyValidation, senderDomainOf } from "@/lib/deliverability";
 import "@/lib/workerBoot";
 
 const MAX_BATCH = 100000;
@@ -194,6 +196,44 @@ export async function POST(req) {
       senderId = s.id;
     }
 
+    // Resolve effective sender (chosen / default / env) and block free-mail
+    // domains — DMARC alignment is impossible with gmail.com / yahoo.com / etc.
+    const effectiveSender = await resolveSenderForJob({ sender_id: senderId });
+    const effectiveDomain = senderDomainOf(effectiveSender?.email);
+    if (!effectiveSender?.email) {
+      return NextResponse.json({
+        success: false,
+        error: "No sender identity configured. Add one under Settings → Sender identities."
+      }, { status: 400 });
+    }
+    if (isFreeMailFromDomain(effectiveSender.email)) {
+      return NextResponse.json({
+        success: false,
+        error: `Cannot send from ${effectiveSender.email}: DMARC will fail for the @${effectiveDomain} domain. Use a sender on a domain you control (with DKIM+SPF set up).`,
+      }, { status: 400 });
+    }
+
+    // Read the postal-address setting (optional but recommended for CAN-SPAM).
+    const [[addrRow]] = await db.query(
+      `SELECT setting_value FROM app_settings WHERE setting_key = 'compliance_postal_address' LIMIT 1`
+    ).catch(() => [[]]);
+    const postalAddress = addrRow?.setting_value || "";
+    const requireAddress =
+      (process.env.REQUIRE_POSTAL_ADDRESS || "").toLowerCase() === "true";
+
+    // Body validation (hard errors block; warnings just pass-through).
+    const { errors: bodyErrors, warnings: bodyWarnings } = bodyValidation(message, {
+      requireAddress,
+      addressLine: postalAddress,
+    });
+    if (bodyErrors.length) {
+      return NextResponse.json({
+        success: false,
+        error: bodyErrors.join(" "),
+        warnings: bodyWarnings,
+      }, { status: 400 });
+    }
+
     const jobId = await createJob({
       source,
       subject,
@@ -217,6 +257,7 @@ export async function POST(req) {
       campaignId,
       total: recipients.length,
       skipped: skippedCount,
+      warnings: bodyWarnings,
     });
   } catch (err) {
     console.error("email-send error", err);

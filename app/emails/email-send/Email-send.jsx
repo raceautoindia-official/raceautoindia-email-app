@@ -326,9 +326,31 @@ const BulkEmailSender = () => {
     setShowPasswordModal(true);
   };
 
+  const hasUnsubscribeLink = htmlContent.includes("{{unsubscribe_link}}");
+
+  // ALL-CAPS / repeated punctuation / known trigger words.
+  const subjectSpamWarnings = (() => {
+    const w = [];
+    const s = subject || "";
+    if (!s.trim()) return w;
+    if (s.length > 140) w.push("Subject is very long (>140 chars).");
+    const letters = s.replace(/[^A-Za-z]/g, "");
+    if (letters.length >= 8) {
+      const upper = letters.replace(/[^A-Z]/g, "").length;
+      if (upper / letters.length > 0.6) w.push("Subject is mostly upper-case.");
+    }
+    if (/!{2,}|\?{2,}/.test(s)) w.push("Repeated !!! / ??? trigger spam filters.");
+    if (/\$\$\$|₹{2,}/.test(s)) w.push("Repeated currency symbols look spammy.");
+    if (/\b(free|act now|urgent|hurry|limited time|click here|buy now|winner|congratulations|100% (free|guaranteed))\b/i.test(s)) {
+      w.push("Subject contains a known spam-trigger phrase.");
+    }
+    return w;
+  })();
+
   const canSend =
     !!subject &&
     !!htmlContent &&
+    hasUnsubscribeLink &&
     !loading &&
     (currentSource !== "category" || selectedCategoryIds.length > 0) &&
     (currentSource !== "excel" || !!excelFile);
@@ -609,6 +631,13 @@ const BulkEmailSender = () => {
                   onChange={(e) => setSubject(e.target.value)}
                   placeholder="Enter subject"
                 />
+                {subjectSpamWarnings.length > 0 && (
+                  <div className="mt-1">
+                    {subjectSpamWarnings.map((w, i) => (
+                      <small key={i} className="d-block text-warning">⚠ {w}</small>
+                    ))}
+                  </div>
+                )}
               </Form.Group>
 
               <Form.Group className="mb-3">
@@ -619,9 +648,9 @@ const BulkEmailSender = () => {
                   value={htmlContent}
                   onChange={(e) => setHtmlContent(e.target.value)}
                 />
-                {htmlContent && !htmlContent.includes("{{unsubscribe_link}}") && (
-                  <small className="text-warning">
-                    ⚠ Missing <code>{"{{unsubscribe_link}}"}</code> — required for compliance.
+                {htmlContent && !hasUnsubscribeLink && (
+                  <small className="text-danger d-block mt-1">
+                    ✗ Missing <code>{"{{unsubscribe_link}}"}</code> — required for compliance. Send is disabled until you add it.
                   </small>
                 )}
               </Form.Group>

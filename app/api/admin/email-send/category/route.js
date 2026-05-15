@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import db from "@/lib/db";
 import { createJob, addRecipients } from "@/lib/jobs";
 import { getSuppressedSet } from "@/lib/suppression";
+import { resolveSenderForJob } from "@/lib/senders";
+import { isFreeMailFromDomain, senderDomainOf, bodyValidation } from "@/lib/deliverability";
 import "@/lib/workerBoot";
 
 // Backwards-compatible: kept for existing clients. Now also supports
@@ -32,6 +34,25 @@ export async function POST(req) {
         { success: false, error: "Missing subject, message or category" },
         { status: 400 }
       );
+    }
+
+    const { errors: bodyErrors } = bodyValidation(message);
+    if (bodyErrors.length) {
+      return NextResponse.json({ success: false, error: bodyErrors.join(" ") }, { status: 400 });
+    }
+
+    const sender = await resolveSenderForJob({});
+    if (!sender?.email) {
+      return NextResponse.json({
+        success: false,
+        error: "No sender identity configured. Add one under Settings → Sender identities."
+      }, { status: 400 });
+    }
+    if (isFreeMailFromDomain(sender.email)) {
+      return NextResponse.json({
+        success: false,
+        error: `Cannot send from ${sender.email}: DMARC will fail for the @${senderDomainOf(sender.email)} domain. Use a sender on a domain you control.`,
+      }, { status: 400 });
     }
 
     const placeholders = ids.map(() => "?").join(",");
